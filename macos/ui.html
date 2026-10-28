@@ -267,6 +267,10 @@ pre.log { margin: 12px 0 0; max-height: 260px; overflow: auto; background: #0F1A
           <button type="button" id="app-log-btn" class="quiet">Show app log</button>
         </div>
         <small style="color:var(--ink-2);display:block;margin-top:8px">Restarting clears the live room.</small>
+        <label class="switch"><input type="checkbox" id="captive_portal_on"> <span>Welcome pop-up when phones join</span></label>
+        <small style="color:var(--ink-2);display:block">Phones show a welcome page with a button that opens the app. Until someone taps it, their phone can only reach that page.</small>
+        <label class="field"><span>Welcome page title</span><input id="portal_title"></label>
+        <label class="field"><span>Button opens this page of the app</span><input id="portal_next" class="mono"></label>
         <pre class="log hidden" id="app-log"></pre>
       </fieldset>
 
@@ -308,11 +312,13 @@ const SIZES = {
   "1000": { lan_addr: "192.168.48.1", lan_prefix: "22", dhcp_start: "192.168.48.10", dhcp_end: "192.168.51.250" },
 };
 const SETTINGS = ["wan_if", "lan_if", "lan_addr", "lan_prefix", "dhcp_start", "dhcp_end", "dhcp_lease",
-  "upstream_dns", "tcp_ports", "udp_ports", "app_name", "app_ports", "app_redirect", "log_queries"];
+  "upstream_dns", "tcp_ports", "udp_ports", "app_name", "app_ports", "app_redirect", "log_queries",
+  "captive_portal", "portal_title", "portal_next"];
 const LABELS = { wan_if: "internet port", lan_if: "access point port", lan_addr: "gateway address",
   lan_prefix: "network size", dhcp_start: "first address", dhcp_end: "last address", dhcp_lease: "lease",
   upstream_dns: "DNS servers", tcp_ports: "TCP ports", udp_ports: "UDP ports", app_name: "app address",
-  app_ports: "app port", app_redirect: "plain app address", log_queries: "lookup log" };
+  app_ports: "app port", app_redirect: "plain app address", log_queries: "lookup log",
+  captive_portal: "welcome pop-up", portal_title: "welcome title", portal_next: "welcome button opens" };
 
 let token = "";
 let server = null;     // last /api/state
@@ -415,6 +421,8 @@ function renderStatus() {
   if (st.app === "lan") item("ok", "Summit is running at ", el("span", { class: "mono" }, app));
   else if (st.app === "localhost-only") item("wait", "Summit only answers on this Mac, so phones can't reach it");
   else if (st.app === "down") item("no", el("strong", {}, "Summit isn't running"));
+  if (st.portal) item(st.portal_count ? "ok" : "", el("strong", {}, String(st.portal_count)),
+    st.portal_count === 1 ? " phone joined through the welcome pop-up" : " phones joined through the welcome pop-up");
   item("", "Internet via " + st.wan_if);
 }
 
@@ -492,8 +500,10 @@ function renderSettings() {
   const size = currentSize();
   for (const r of document.querySelectorAll("input[name=size]")) r.checked = r.value === size;
   $("custom-net").classList.toggle("hidden", size !== "custom");
-  for (const k of ["lan_addr", "lan_prefix", "dhcp_start", "dhcp_end", "upstream_dns", "tcp_ports", "udp_ports", "app_name", "app_ports"])
+  for (const k of ["lan_addr", "lan_prefix", "dhcp_start", "dhcp_end", "upstream_dns", "tcp_ports", "udp_ports", "app_name", "app_ports", "portal_title", "portal_next"])
     if (document.activeElement !== $(k)) $(k).value = draft[k];
+  $("captive_portal_on").checked = draft.captive_portal === "yes";
+  $("portal_title").disabled = $("portal_next").disabled = draft.captive_portal !== "yes";
   const lease = $("dhcp_lease");
   if (![...lease.options].some((o) => o.value === draft.dhcp_lease)) lease.append(el("option", { value: draft.dhcp_lease }, draft.dhcp_lease));
   lease.value = draft.dhcp_lease;
@@ -607,7 +617,8 @@ for (const r of document.querySelectorAll("input[name=size]")) r.addEventListene
   $("custom-net").classList.toggle("hidden", r.value !== "custom");
   changed();
 });
-for (const k of ["lan_addr", "lan_prefix", "dhcp_start", "dhcp_end", "upstream_dns", "tcp_ports", "udp_ports", "app_name", "app_ports"])
+$("captive_portal_on").addEventListener("change", () => { draft.captive_portal = $("captive_portal_on").checked ? "yes" : "no"; renderSettings(); renderBar(); });
+for (const k of ["lan_addr", "lan_prefix", "dhcp_start", "dhcp_end", "upstream_dns", "tcp_ports", "udp_ports", "app_name", "app_ports", "portal_title", "portal_next"])
   $(k).addEventListener("input", () => { draft[k] = $(k).value.trim(); renderBar(); if (k === "app_name") $("app-url").textContent = "http://" + (draft.app_name || "app.lan"); });
 $("dhcp_lease").addEventListener("change", () => { draft.dhcp_lease = $("dhcp_lease").value; renderBar(); });
 $("wan_if").addEventListener("change", () => { draft.wan_if = $("wan_if").value; renderBar(); });

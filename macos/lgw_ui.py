@@ -40,6 +40,7 @@ FIELDS = [
     ("app_repo", "LOCAL_APP_REPO"), ("app_branch", "LOCAL_APP_BRANCH"), ("app_dir", "LOCAL_APP_DIR"),
     ("app_command", "LOCAL_APP_COMMAND"), ("app_command_mac", "LOCAL_APP_COMMAND_MAC"),
     ("log_queries", "LOG_DNS_QUERIES"),
+    ("captive_portal", "CAPTIVE_PORTAL"), ("portal_title", "PORTAL_TITLE"), ("portal_next", "PORTAL_NEXT"),
 ]
 SAFE_VALUE = re.compile(r"^[A-Za-z0-9 ._:/@+=,~-]*$")
 
@@ -128,6 +129,11 @@ LOCAL_APP_DIR="%s"
 LOCAL_APP_COMMAND="%s"
 LOCAL_APP_COMMAND_MAC="%s"
 
+# ---- Welcome pop-up (macOS) ----
+CAPTIVE_PORTAL="%s"
+PORTAL_TITLE="%s"
+PORTAL_NEXT="%s"
+
 # ---- Logging ----
 LOG_DNS_QUERIES="%s"
 """ % (time.strftime("%Y-%m-%d %H:%M"),
@@ -136,6 +142,7 @@ LOG_DNS_QUERIES="%s"
        v("ALLOWED_TCP_PORTS"), v("ALLOWED_UDP_PORTS"),
        v("LOCAL_APP_NAME"), v("LOCAL_APP_PORTS"), v("LOCAL_APP_HTTP_REDIRECT"), v("LOCAL_APP_REPO"),
        v("LOCAL_APP_BRANCH"), v("LOCAL_APP_DIR"), v("LOCAL_APP_COMMAND"), v("LOCAL_APP_COMMAND_MAC"),
+       v("CAPTIVE_PORTAL") or "no", v("PORTAL_TITLE"), v("PORTAL_NEXT"),
        v("LOG_DNS_QUERIES") or "yes")
 
 
@@ -359,11 +366,20 @@ def state(started):
             "since": started,
             "wan_if": cfg.wan_if, "lan_if": cfg.lan_if, "lan_addr": str(cfg.lan_addr),
             "app_dir": st.get("app_dir", ""),
+            "portal": cfg.captive_portal,
+            "portal_count": portal_count(),
         },
         "interfaces": interfaces(),
         "refused": refused,
         "recent": recent,
     }
+
+
+def portal_count():
+    try:
+        return len(json.load(open(m.CONF_DIR + "/portal.json")))
+    except (OSError, ValueError, TypeError):
+        return 0
 
 
 def check_domain(name):

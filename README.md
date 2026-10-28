@@ -140,6 +140,23 @@ The page only listens on this Mac (`127.0.0.1:8699`), never on the access point 
 
 Running `install` again **keeps the settings you made on this page**. To replace them with the repo's `config.env`, run `sudo ./macos/lan-gateway-mac install --reset-config`.
 
+### Welcome pop-up (Mac)
+
+With `CAPTIVE_PORTAL="yes"` (the default in `config.env`), the Wi-Fi works like hotel or airport Wi-Fi, so **one QR code is enough**: the one that joins the Wi-Fi.
+
+1. A phone joins the Wi-Fi.
+2. It shows a welcome page. iPhones pop it up right away; Android shows a "Sign in to Wi-Fi network" notification to tap.
+3. The page has one big **Join the session** button. Tapping it opens the Summit audience page (`PORTAL_NEXT`, default `/audience`).
+4. From then on the phone gets the normal rules: allowed sites work, its internet check passes, and it keeps using the Wi-Fi even with mobile data on.
+
+Until a phone taps the button, every plain web request it makes (including its internet check) goes to the welcome page, and HTTPS to the internet is refused. The app itself stays reachable at `http://192.168.50.1:8688`.
+
+The gateway remembers phones that tapped through for 12 hours, across restarts, in `/usr/local/etc/lan-gateway/portal.json`. You can turn the pop-up on or off, and change its title and the page the button opens, on the settings page.
+
+On some Android phones the pop-up window closes by itself once the phone counts as connected. The page shows the audience address for that case.
+
+The Linux version doesn't have the welcome pop-up yet.
+
 ### Commands on a Mac
 
 Same as Linux, with `lan-gateway-mac`:

@@ -50,6 +50,8 @@ BOOTPS_SYSTEM_PLIST = "/System/Library/LaunchDaemons/bootps.plist"
 BOOTPD_LABEL = "com.apple.bootpd"
 DHCP_LEASES = "/var/db/dhcpd_leases"
 DNS_TABLE = "allowed_dns4"
+PORTAL_TABLE = "portal_ok"
+PORTAL_PORT = int(os.environ.get("LGW_PORTAL_PORT", "8690"))
 STATIC_TABLE = "allowed_static4"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -179,6 +181,12 @@ class Config:
         self.app_dir = e.get("LOCAL_APP_DIR", "").strip()
         self.app_command = e.get("LOCAL_APP_COMMAND_MAC", "").strip() or e.get("LOCAL_APP_COMMAND", "").strip()
         self.log_queries = e.get("LOG_DNS_QUERIES", "yes").strip() == "yes"
+        self.captive_portal = e.get("CAPTIVE_PORTAL", "no").strip() == "yes"
+        self.portal_title = e.get("PORTAL_TITLE", "").strip() or "Welcome to the Summit"
+        nxt = e.get("PORTAL_NEXT", "").strip() or "/audience"
+        if not nxt.startswith("/") or not re.match(r"^/[A-Za-z0-9._~/?=&%-]*$", nxt):
+            raise Fail("PORTAL_NEXT must be a path on the app, like /audience")
+        self.portal_next = nxt
 
     def is_allowed(self, name):
         for d in self.domains:
@@ -316,7 +324,22 @@ def render_pf(cfg):
         "",
         "nat on $wan_if inet from $lan_net to ! $lan_net -> ($wan_if)",
     ]
-    if cfg.app_redirect:
+    if cfg.captive_portal:
+        at = lines.index("# Filled at runtime by the lan-gateway DNS server with IPs of allowed domains")
+        lines[at:at] = [
+            "# Phones that tapped through the welcome page (filled by the gateway)",
+            "table <%s> persist" % PORTAL_TABLE,
+        ]
+        if cfg.app_redirect:
+            lines.append("rdr on $lan_if inet proto tcp from <%s> to $lan_addr port 80 -> $lan_addr port %d"
+                         % (PORTAL_TABLE, cfg.app_redirect))
+        lines += [
+            "# Phones that haven't tapped through: every http request (including the phones'",
+            "# internet check) goes to the welcome page, so they show the sign-in pop-up.",
+            "no rdr on $lan_if inet proto tcp from <%s> to any port 80" % PORTAL_TABLE,
+            "rdr on $lan_if inet proto tcp from $lan_net to any port 80 -> $lan_addr port %d" % PORTAL_PORT,
+        ]
+    elif cfg.app_redirect:
         lines.append("rdr on $lan_if inet proto tcp from $lan_net to $lan_addr port 80 -> $lan_addr port %d"
                      % cfg.app_redirect)
     lines += [
@@ -329,6 +352,13 @@ def render_pf(cfg):
     if cfg.app_ports:
         lines.append("pass in quick on $lan_if inet proto tcp from $lan_net to $lan_addr port %s"
                      % lst(cfg.app_ports))
+    if cfg.captive_portal:
+        lines += [
+            "pass in quick on $lan_if inet proto tcp from $lan_net to $lan_addr port %d" % PORTAL_PORT,
+            "# Until they tap through, refuse https to the internet at once, so the phone",
+            "# decides quickly that this network needs a sign-in.",
+            "block return in quick on $lan_if inet proto { tcp, udp } from ! <%s> to ! $lan_addr port 443" % PORTAL_TABLE,
+        ]
     for proto, plist in (("tcp", cfg.tcp_ports), ("udp", cfg.udp_ports)):
         if plist:
             for table in (DNS_TABLE, STATIC_TABLE):
@@ -731,6 +761,10 @@ def cmd_daemon(args):
     log = make_logger()
     table = PfTable()
     net = "--no-network" not in args
+    portal = None
+    if cfg.captive_portal:
+        import lgw_portal
+        portal = lgw_portal.Portal(cfg, log)
 
     def ensure():
         if not net:
@@ -742,6 +776,8 @@ def cmd_daemon(args):
         if not anchor_loaded():
             load_anchor()
             table.reset()
+            if portal:
+                portal.resync()
             log("loaded pf anchor %s" % ANCHOR)
         if not pf_enabled():
             pf_enable()
@@ -756,6 +792,9 @@ def cmd_daemon(args):
             pf_enable()
         log("network ready: %s -> %s (LAN %s via %s)" % (cfg.lan_if, cfg.wan_if, cfg.lan_net, cfg.lan_addr))
     port = int(os.environ.get("LGW_DNS_PORT", "53"))
+    if portal:
+        portal.resync()
+        portal.start()
     start_dns(cfg, table, log, port)
     if os.environ.get("LGW_NO_UI") != "1":
         try:
@@ -766,6 +805,8 @@ def cmd_daemon(args):
     while True:
         time.sleep(15)
         try:
+            if portal:
+                portal.housekeep()
             ensure()
         except Exception as exc:          # keep serving DNS whatever happens
             log("maintenance error: %s" % exc)
@@ -920,7 +961,7 @@ def cmd_install(args):
     set_env_value(CONFIG, "WAN_IF", cfg.wan_if)
     set_env_value(CONFIG, "LAN_IF", cfg.lan_if)
     cfg = Config(CONFIG)
-    for name in ("lgw_mac.py", "lgw_ui.py", "ui.html"):
+    for name in ("lgw_mac.py", "lgw_ui.py", "lgw_portal.py", "ui.html"):
         shutil.copy2(os.path.join(HERE, name), os.path.join(LIB_DIR, name))
     shutil.copy2(os.path.join(HERE, "lan-gateway-mac"), "/usr/local/bin/lan-gateway-mac")
     os.chmod("/usr/local/bin/lan-gateway-mac", 0o755)
