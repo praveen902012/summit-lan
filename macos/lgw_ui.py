@@ -176,6 +176,18 @@ def apply_config(payload, schedule_restart):
             if not SAFE_VALUE.match(val):
                 raise m.Fail("%s contains characters that aren't allowed: %r" % (key, val))
             raw[key] = val
+    nxt = raw.get("PORTAL_NEXT", "").strip()
+    if re.match(r"^https?://", nxt, re.I):
+        # Accept a full address of the app and keep only its path, e.g.
+        # http://192.168.50.1/audience -> /audience
+        u = urllib.parse.urlsplit(nxt)
+        ours = {raw.get("LAN_ADDR", ""), raw.get("LOCAL_APP_NAME", "").lower()} - {""}
+        if (u.hostname or "").lower() not in ours:
+            raise m.Fail("The welcome button can only open a page of the Summit app, like /audience "
+                         "(%s is a different site)" % u.hostname)
+        raw["PORTAL_NEXT"] = (u.path or "/") + ("?" + u.query if u.query else "")
+    elif nxt and not nxt.startswith("/"):
+        raw["PORTAL_NEXT"] = "/" + nxt
     if "domains" in payload:
         doms, seen = [], set()
         for d in payload["domains"]:

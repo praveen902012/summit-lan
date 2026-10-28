@@ -185,7 +185,7 @@ class Config:
         self.portal_title = e.get("PORTAL_TITLE", "").strip() or "Welcome to the Summit"
         nxt = e.get("PORTAL_NEXT", "").strip() or "/audience"
         if not nxt.startswith("/") or not re.match(r"^/[A-Za-z0-9._~/?=&%-]*$", nxt):
-            raise Fail("PORTAL_NEXT must be a path on the app, like /audience")
+            raise Fail("The welcome button page must be a page of the Summit app, like /audience")
         self.portal_next = nxt
 
     def is_allowed(self, name):
