@@ -38,13 +38,13 @@ ANCHOR = "com.apple/100.lan-gateway"
 LABEL = "in.t4gc.lan-gateway"
 APP_LABEL = "in.t4gc.lan-gateway-app"
 LIB_DIR = "/usr/local/lib/lan-gateway"
-CONF_DIR = "/usr/local/etc/lan-gateway"
+CONF_DIR = os.environ.get("LGW_CONF_DIR", "/usr/local/etc/lan-gateway")
 CONFIG = os.environ.get("LGW_CONFIG", CONF_DIR + "/config.env")
 PF_FILE = CONF_DIR + "/pf.anchor"
 STATE = CONF_DIR + "/state.json"
 PLIST = "/Library/LaunchDaemons/%s.plist" % LABEL
 APP_PLIST = "/Library/LaunchDaemons/%s.plist" % APP_LABEL
-LOG = "/var/log/lan-gateway.log"
+LOG = os.environ.get("LGW_LOG", "/var/log/lan-gateway.log")
 BOOTPD_PLIST = "/etc/bootpd.plist"
 BOOTPS_SYSTEM_PLIST = "/System/Library/LaunchDaemons/bootps.plist"
 BOOTPD_LABEL = "com.apple.bootpd"
@@ -70,7 +70,12 @@ def warn(msg):
 
 def run(cmd, check=True):
     """Run a command, return stdout+stderr text."""
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    except OSError as exc:
+        if check:
+            raise Fail("could not run %s: %s" % (cmd[0], exc))
+        return ""
     if check and p.returncode != 0:
         raise Fail("command failed: %s\n%s" % (" ".join(cmd), p.stdout.strip()))
     return p.stdout
@@ -746,6 +751,12 @@ def cmd_daemon(args):
         log("network ready: %s -> %s (LAN %s via %s)" % (cfg.lan_if, cfg.wan_if, cfg.lan_net, cfg.lan_addr))
     port = int(os.environ.get("LGW_DNS_PORT", "53"))
     start_dns(cfg, table, log, port)
+    if os.environ.get("LGW_NO_UI") != "1":
+        try:
+            import lgw_ui
+            lgw_ui.start(log)
+        except Exception as exc:          # the gateway keeps working without the page
+            log("settings page not started: %s" % exc)
     while True:
         time.sleep(15)
         try:
@@ -829,7 +840,8 @@ def cmd_install(args):
     src_config = os.path.join(os.path.dirname(HERE), "config.env")
     if not os.path.exists(src_config):
         raise Fail("config.env not found next to the macos folder")
-    cfg = Config(src_config)
+    keep = os.path.exists(CONFIG) and "--reset-config" not in args
+    cfg = Config(CONFIG if keep else src_config)
     detect_interfaces(cfg)
     check_subnet_overlap(cfg)
     if "bridge100" in run(["ifconfig", "-l"], check=False).split():
@@ -843,11 +855,16 @@ def cmd_install(args):
 
     os.makedirs(CONF_DIR, exist_ok=True)
     os.makedirs(LIB_DIR, exist_ok=True)
-    shutil.copy2(src_config, CONFIG)
+    if keep:
+        info("Keeping your current settings in %s (change them on the settings page;" % CONFIG)
+        info("to replace them with this folder's config.env, run: sudo ./macos/lan-gateway-mac install --reset-config)")
+    else:
+        shutil.copy2(src_config, CONFIG)
     set_env_value(CONFIG, "WAN_IF", cfg.wan_if)
     set_env_value(CONFIG, "LAN_IF", cfg.lan_if)
     cfg = Config(CONFIG)
-    shutil.copy2(os.path.join(HERE, "lgw_mac.py"), LIB_DIR + "/lgw_mac.py")
+    for name in ("lgw_mac.py", "lgw_ui.py", "ui.html"):
+        shutil.copy2(os.path.join(HERE, name), os.path.join(LIB_DIR, name))
     shutil.copy2(os.path.join(HERE, "lan-gateway-mac"), "/usr/local/bin/lan-gateway-mac")
     os.chmod("/usr/local/bin/lan-gateway-mac", 0o755)
 
@@ -916,7 +933,7 @@ def cmd_install(args):
         print("  2. Start your app listening on 0.0.0.0 or %s on port %s."
               % (cfg.lan_addr, " ".join(map(str, cfg.app_ports)) or "?"))
     print("  3. Connect a phone to the access point and open %s/audience and https://idlistack.com" % url)
-    print("  4. Check with: sudo lan-gateway-mac status")
+    print("  4. Change allowed sites and settings on the settings page: lan-gateway-mac ui")
 
 
 def install_app(cfg, python):
@@ -1144,6 +1161,31 @@ def cmd_uninstall(args):
         " (The app's code folder %s was left in place.)" % st["app_dir"] if st.get("app_dir") else ""))
 
 
+def cmd_ui(args):
+    need_mac()
+    token_file = CONF_DIR + "/ui-token"
+    try:
+        token = open(token_file).read().strip()
+    except OSError as exc:
+        if not os.path.exists(CONFIG):
+            raise Fail("not installed yet; run: sudo ./macos/lan-gateway-mac install")
+        raise Fail("can't read %s (%s). Try: sudo lan-gateway-mac ui" % (token_file, exc.strerror))
+    port = int(os.environ.get("LGW_UI_PORT", "8699"))
+    url = "http://127.0.0.1:%d/#t=%s" % (port, token)
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+    except OSError:
+        raise Fail("the settings page isn't running. Check: sudo lan-gateway-mac status  and  %s" % LOG)
+    user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and user and user != "root":   # open the browser as the real user
+        run(["sudo", "-u", user, "open", url], check=False)
+    else:
+        run(["open", url], check=False)
+    print("Opened the settings page in your browser.")
+    print("If it didn't open, paste this address into Safari or Chrome on this Mac:\n  " + url)
+    return 0
+
+
 def cmd_render(args):
     if not args:
         raise Fail("usage: lan-gateway-mac render DIR [CONFIG]")
@@ -1158,6 +1200,7 @@ def cmd_render(args):
 COMMANDS = {
     "install": cmd_install, "reload": cmd_reload, "status": cmd_status, "check": cmd_check,
     "app": cmd_app, "uninstall": cmd_uninstall, "render": cmd_render, "daemon": cmd_daemon,
+    "ui": cmd_ui,
 }
 
 

@@ -120,11 +120,32 @@ This also clones the Summit app into `~/gamesworkshop` and runs it with `LOCAL_A
 
 The installer turns IPv4 and IPv6 off for the Ethernet service in System Settings, so macOS doesn't fight over that port. Uninstall puts it back to DHCP.
 
+### Settings page on a Mac
+
+```bash
+lan-gateway-mac ui        # opens the settings page in your browser (use sudo if it says permission denied)
+```
+
+On the settings page you can:
+- **Change the allowed sites:** add or remove sites, with an optional note, and check that a site resolves.
+- **Scan a page:** enter a web address, and the page lists the other sites it loads (fonts, images, scripts, form targets). Tick the ones you want and add them in one go.
+- **Fix broken sites from the blocked list:** "Recently blocked" lists names phones asked for that aren't allowed. Allow the exact name, or the whole parent domain, with one click.
+- **Change settings:** how many devices (100 / 250 / 1,000 or custom), lease length, which Wi-Fi and Ethernet ports to use, DNS servers, web ports, and the Summit app's address and port.
+- **Run the Summit app:** restart it and view its log.
+- **Back up:** download `config.env`.
+
+Changes collect in a bar at the bottom of the page, shown as + added and − removed. Nothing takes effect until you click **Apply changes**. The gateway then checks the new settings and restarts in a couple of seconds; phones stay connected.
+
+The page only listens on this Mac (`127.0.0.1:8699`), never on the access point side. It needs the key stored in `/usr/local/etc/lan-gateway/ui-token`, which `lan-gateway-mac ui` passes to the browser, so other websites open in your browser can't change your settings.
+
+Running `install` again **keeps the settings you made on this page**. To replace them with the repo's `config.env`, run `sudo ./macos/lan-gateway-mac install --reset-config`.
+
 ### Commands on a Mac
 
 Same as Linux, with `lan-gateway-mac`:
 
 ```bash
+lan-gateway-mac ui                   # settings page
 sudo lan-gateway-mac status          # devices, allowed IPs, rule counters, refused names
 sudo lan-gateway-mac check example.com
 sudo nano /usr/local/etc/lan-gateway/config.env && sudo lan-gateway-mac reload

@@ -2,6 +2,7 @@
 # lan-gateway for macOS: Wi-Fi (internet) -> Mac (NAT + DHCP + DNS allowlist + firewall) -> Ethernet -> access point
 #
 #   sudo ./lan-gateway-mac install       first-time setup (reads ../config.env)
+#        lan-gateway-mac ui              open the settings page (allowed sites, devices, ports, app)
 #   sudo lan-gateway-mac reload          re-read /usr/local/etc/lan-gateway/config.env and apply
 #   sudo lan-gateway-mac status          interfaces, devices, allowed IPs, rule counters, refused names
 #   sudo lan-gateway-mac check DOMAIN    is this domain allowed?
