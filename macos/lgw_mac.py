@@ -627,6 +627,10 @@ class Resolver:
             return make_reply(q, qend, NOERROR)
         if name == "use-application-dns.net":          # tells Firefox to turn off DoH
             return make_reply(q, qend, NXDOMAIN)
+        if name in ("mask.icloud.com", "mask-h2.icloud.com"):
+            # Apple's documented signal that iCloud Private Relay isn't available on this
+            # network; the device alerts the user instead of stalling.
+            return make_reply(q, qend, NXDOMAIN)
         if not cfg.is_allowed(name):
             self.log("REFUSED %s %s" % (client, name))
             return make_reply(q, qend, REFUSED)

@@ -271,6 +271,11 @@ dhcp-authoritative
 
 # Tells Firefox to turn off its built-in DNS-over-HTTPS
 address=/use-application-dns.net/
+
+# Tells iPhones/Macs that iCloud Private Relay can't be used here (Apple's documented
+# signal: NXDOMAIN). Without it, Apple devices can stall instead of using the Wi-Fi.
+address=/mask.icloud.com/
+address=/mask-h2.icloud.com/
 EOF
   if [[ ${LOG_DNS_QUERIES:-no} == yes ]]; then echo "log-queries"; fi
 
