@@ -1,0 +1,47 @@
+#!/bin/sh
+# lan-gateway for macOS: Wi-Fi (internet) -> Mac (NAT + DHCP + DNS allowlist + firewall) -> Ethernet -> access point
+#
+#   sudo ./lan-gateway-mac install       first-time setup (reads ../config.env)
+#   sudo lan-gateway-mac reload          re-read /usr/local/etc/lan-gateway/config.env and apply
+#   sudo lan-gateway-mac status          interfaces, devices, allowed IPs, rule counters, refused names
+#   sudo lan-gateway-mac check DOMAIN    is this domain allowed?
+#   sudo lan-gateway-mac app CMD         local app service: status|start|stop|restart|update|logs
+#   sudo lan-gateway-mac uninstall       remove everything and restore normal networking
+#        lan-gateway-mac render DIR      write the generated pf/bootpd/launchd files to DIR for review
+#
+# The Mac's own traffic is never filtered; only devices behind the access point are.
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$DIR/lgw_mac.py" ]; then
+  SCRIPT="$DIR/lgw_mac.py"
+else
+  SCRIPT=/usr/local/lib/lan-gateway/lgw_mac.py
+fi
+
+ok_python() {
+  [ -x "$1" ] && "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null
+}
+
+PY=""
+# Once installed, keep using the same Python the services run with.
+STATE=/usr/local/etc/lan-gateway/state.json
+if [ -r "$STATE" ]; then
+  P=$(sed -n 's/.*"python": *"\([^"]*\)".*/\1/p' "$STATE" | head -1)
+  ok_python "$P" && PY="$P"
+fi
+if [ -z "$PY" ]; then
+  for P in /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    if ok_python "$P"; then PY="$P"; break; fi
+  done
+fi
+# /usr/bin/python3 is only real once the Xcode Command Line Tools are installed
+# (otherwise running it pops up an install dialog).
+if [ -z "$PY" ] && xcode-select -p >/dev/null 2>&1 && ok_python /usr/bin/python3; then
+  PY=/usr/bin/python3
+fi
+if [ -z "$PY" ]; then
+  echo "ERROR: no Python 3.8+ found. Install one with:  xcode-select --install   (or: brew install python)" >&2
+  exit 1
+fi
+
+exec "$PY" "$SCRIPT" "$@"

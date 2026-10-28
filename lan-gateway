@@ -1,0 +1,667 @@
+#!/usr/bin/env bash
+# lan-gateway — turn a laptop into an allowlist gateway:
+#   Wi-Fi (internet)  ->  laptop (NAT + DHCP + DNS allowlist + firewall)  ->  Ethernet  ->  access point
+#
+# LAN clients can reach ONLY the domains/IPs in config.env plus the local app.
+# The laptop's own traffic is never filtered.
+#
+# Usage:
+#   sudo ./lan-gateway install      first-time setup (packages, files, service)
+#   sudo lan-gateway reload         re-read /etc/lan-gateway/config.env and apply
+#   sudo lan-gateway status         show interfaces, clients, allowed IPs, drops
+#   sudo lan-gateway check DOMAIN   test whether a domain is allowed
+#   sudo lan-gateway app CMD        local app service: status|restart|stop|start|update|logs
+#   sudo lan-gateway uninstall      remove everything and restore normal networking
+#        lan-gateway render DIR     write generated configs to DIR (no root, for review)
+#   (apply / down are used by the systemd service)
+
+set -euo pipefail
+
+NAME="lan-gateway"
+ETC_DIR="/etc/$NAME"
+BIN_PATH="/usr/local/sbin/$NAME"
+UNIT_PATH="/etc/systemd/system/$NAME.service"
+APP_UNIT="$NAME-app.service"
+APP_UNIT_PATH="/etc/systemd/system/$APP_UNIT"
+DNSMASQ_CONF="/etc/dnsmasq.d/$NAME.conf"
+NM_CONF="/etc/NetworkManager/conf.d/90-$NAME.conf"
+SYSCTL_CONF="/etc/sysctl.d/90-$NAME.conf"
+NFT_TABLE="lan_gw"
+NFT_NAT_TABLE="lan_gw_nat"
+NFT_DNS_SET="allowed_dns4"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARNING: $*" >&2; }
+info() { echo "==> $*"; }
+
+need_root() { [[ $EUID -eq 0 ]] || die "run this with sudo"; }
+
+# ---------------------------------------------------------------- config ----
+
+load_config() {
+  local cfg="${1:-}"
+  if [[ -z $cfg ]]; then
+    if [[ -f $ETC_DIR/config.env ]]; then cfg="$ETC_DIR/config.env"
+    elif [[ -f $SCRIPT_DIR/config.env ]]; then cfg="$SCRIPT_DIR/config.env"
+    else die "config.env not found"; fi
+  fi
+  # shellcheck source=config.env
+  source "$cfg"
+  CONFIG_FILE="$cfg"
+}
+
+ip2int() { local IFS=.; local a b c d; read -r a b c d <<<"$1"; echo $(( (a<<24) | (b<<16) | (c<<8) | d )); }
+int2ip() { local n=$1; echo "$(( (n>>24)&255 )).$(( (n>>16)&255 )).$(( (n>>8)&255 )).$(( n&255 ))"; }
+mask_of() { echo $(( (0xFFFFFFFF << (32 - $1)) & 0xFFFFFFFF )); }
+
+is_ipv4() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local o; for o in "${BASH_REMATCH[@]:1}"; do (( o <= 255 )) || return 1; done
+}
+is_domain() { [[ $1 =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; }
+is_port()   { [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+
+# Join words with ", " for nft set syntax.
+join_nft() { local out="" w; for w in "$@"; do out+="${out:+, }$w"; done; echo "$out"; }
+
+detect_interfaces() {
+  if [[ -z ${WAN_IF:-} ]]; then
+    WAN_IF="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    [[ -n $WAN_IF ]] || die "no default route found. Connect to Wi-Fi first, or set WAN_IF in config.env"
+    [[ -e /sys/class/net/$WAN_IF/wireless ]] || warn "$WAN_IF (default route) is not a Wi-Fi interface; set WAN_IF if that is wrong"
+  fi
+  if [[ -z ${LAN_IF:-} ]]; then
+    local cands=() p n
+    for p in /sys/class/net/*; do
+      n="${p##*/}"
+      [[ $n == "$WAN_IF" || $n == lo ]] && continue
+      [[ -e $p/device && ! -e $p/wireless ]] && cands+=("$n")
+    done
+    (( ${#cands[@]} == 1 )) || die "found ${#cands[@]} wired interfaces (${cands[*]:-none}); set LAN_IF in config.env"
+    LAN_IF="${cands[0]}"
+  fi
+  [[ -e /sys/class/net/$WAN_IF ]] || die "WAN_IF '$WAN_IF' does not exist"
+  [[ -e /sys/class/net/$LAN_IF ]] || die "LAN_IF '$LAN_IF' does not exist"
+  [[ $WAN_IF != "$LAN_IF" ]] || die "WAN_IF and LAN_IF are the same interface"
+}
+
+validate_config() {
+  local d p ip
+  is_ipv4 "$LAN_ADDR"   || die "LAN_ADDR '$LAN_ADDR' is not an IPv4 address"
+  is_ipv4 "$DHCP_START" || die "DHCP_START is not an IPv4 address"
+  is_ipv4 "$DHCP_END"   || die "DHCP_END is not an IPv4 address"
+  if ! [[ $LAN_PREFIX =~ ^[0-9]+$ ]] || (( LAN_PREFIX < 8 || LAN_PREFIX > 30 )); then
+    die "LAN_PREFIX must be 8-30"
+  fi
+
+  local mask; mask=$(mask_of "$LAN_PREFIX")
+  LAN_NET="$(int2ip $(( $(ip2int "$LAN_ADDR") & mask )))/$LAN_PREFIX"
+  LAN_MASK="$(int2ip "$mask")"
+  for ip in "$DHCP_START" "$DHCP_END"; do
+    (( ($(ip2int "$ip") & mask) == ($(ip2int "$LAN_ADDR") & mask) )) || die "$ip is outside $LAN_NET"
+  done
+  (( $(ip2int "$DHCP_START") <= $(ip2int "$DHCP_END") )) || die "DHCP_START is after DHCP_END"
+  local a s e; a=$(ip2int "$LAN_ADDR"); s=$(ip2int "$DHCP_START"); e=$(ip2int "$DHCP_END")
+  (( a < s || a > e )) || die "LAN_ADDR must not be inside the DHCP range"
+
+  DOMAINS=()
+  for d in ${ALLOWED_DOMAINS:-}; do
+    d="${d,,}"; d="${d%.}"; d="${d#http://}"; d="${d#https://}"; d="${d%%/*}"
+    is_domain "$d" || die "invalid domain in ALLOWED_DOMAINS: '$d'"
+    DOMAINS+=("$d")
+  done
+  (( ${#DOMAINS[@]} > 0 )) || die "ALLOWED_DOMAINS is empty"
+
+  STATIC_IPS=()
+  for ip in ${ALLOWED_IPS:-}; do
+    is_ipv4 "${ip%/*}" || die "invalid address in ALLOWED_IPS: '$ip'"
+    STATIC_IPS+=("$ip")
+  done
+
+  UPSTREAMS=()
+  for ip in ${UPSTREAM_DNS:-}; do is_ipv4 "$ip" || die "invalid UPSTREAM_DNS '$ip'"; UPSTREAMS+=("$ip"); done
+  (( ${#UPSTREAMS[@]} > 0 )) || die "UPSTREAM_DNS is empty"
+
+  TCP_PORTS=(); for p in ${ALLOWED_TCP_PORTS:-}; do is_port "$p" || die "bad port '$p'"; TCP_PORTS+=("$p"); done
+  UDP_PORTS=(); for p in ${ALLOWED_UDP_PORTS:-}; do is_port "$p" || die "bad port '$p'"; UDP_PORTS+=("$p"); done
+  APP_PORTS=(); for p in ${LOCAL_APP_PORTS:-}; do is_port "$p" || die "bad port '$p'"; APP_PORTS+=("$p"); done
+  if [[ -n ${LOCAL_APP_HTTP_REDIRECT:-} ]]; then
+    is_port "$LOCAL_APP_HTTP_REDIRECT" || die "bad LOCAL_APP_HTTP_REDIRECT"
+    [[ $LOCAL_APP_HTTP_REDIRECT == 80 ]] && LOCAL_APP_HTTP_REDIRECT=""
+  fi
+  if [[ -n ${LOCAL_APP_NAME:-} ]]; then
+    LOCAL_APP_NAME="${LOCAL_APP_NAME,,}"
+    is_domain "$LOCAL_APP_NAME" || die "invalid LOCAL_APP_NAME"
+  fi
+}
+
+check_subnet_overlap() {
+  local cidr addr pfx m
+  while read -r cidr; do
+    [[ -n $cidr ]] || continue
+    addr="${cidr%/*}"; pfx="${cidr#*/}"
+    (( pfx > LAN_PREFIX )) && pfx=$LAN_PREFIX
+    m=$(mask_of "$pfx")
+    if (( ($(ip2int "$addr") & m) == ($(ip2int "$LAN_ADDR") & m) )); then
+      die "LAN subnet $LAN_NET overlaps the Wi-Fi network ($cidr). Change LAN_ADDR/DHCP_* in config.env"
+    fi
+  done < <(ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | awk '{print $4}')
+}
+
+# ---------------------------------------------------------------- render ----
+
+render_nft() {
+  local app_rule="" redirect_rule="" static_set="" static_rules=""
+  if (( ${#APP_PORTS[@]} )); then
+    app_rule="    tcp dport { $(join_nft "${APP_PORTS[@]}") } accept comment \"local app\""
+  fi
+  if [[ -n ${LOCAL_APP_HTTP_REDIRECT:-} ]]; then
+    redirect_rule="    iifname \"$LAN_IF\" ip daddr $LAN_ADDR tcp dport 80 redirect to :$LOCAL_APP_HTTP_REDIRECT comment \"http://$LOCAL_APP_NAME -> app\""
+    # The redirected port must be open in the input chain.
+    if [[ " ${APP_PORTS[*]} " != *" $LOCAL_APP_HTTP_REDIRECT "* ]]; then
+      app_rule+=$'\n'"    tcp dport $LOCAL_APP_HTTP_REDIRECT accept comment \"local app (redirect target)\""
+    fi
+  fi
+  if (( ${#STATIC_IPS[@]} )); then
+    static_set="    elements = { $(join_nft "${STATIC_IPS[@]}") }"
+  fi
+  if (( ${#TCP_PORTS[@]} )); then
+    static_rules+="    ip daddr @$NFT_DNS_SET tcp dport { $(join_nft "${TCP_PORTS[@]}") } accept"$'\n'
+    static_rules+="    ip daddr @allowed_static4 tcp dport { $(join_nft "${TCP_PORTS[@]}") } accept"$'\n'
+  fi
+  if (( ${#UDP_PORTS[@]} )); then
+    static_rules+="    ip daddr @$NFT_DNS_SET udp dport { $(join_nft "${UDP_PORTS[@]}") } accept"$'\n'
+    static_rules+="    ip daddr @allowed_static4 udp dport { $(join_nft "${UDP_PORTS[@]}") } accept"$'\n'
+  fi
+
+  cat <<EOF
+#!/usr/sbin/nft -f
+# Generated by $NAME from $CONFIG_FILE — do not edit; edit config.env and run: sudo $NAME reload
+#
+# Only traffic arriving on $LAN_IF (the access-point side) is filtered.
+# The laptop's own traffic over $WAN_IF is untouched.
+
+table inet $NFT_TABLE {
+  # Filled at runtime by dnsmasq with the IPs of allowed domains.
+  set $NFT_DNS_SET {
+    type ipv4_addr
+  }
+
+  # Fixed IPs from ALLOWED_IPS.
+  set allowed_static4 {
+    type ipv4_addr
+    flags interval
+    auto-merge
+$static_set
+  }
+
+  # Traffic from LAN clients to the laptop itself.
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname != "$LAN_IF" accept
+    ct state established,related accept
+    ct state invalid drop
+    udp dport 67 accept comment "DHCP"
+    udp dport 53 accept comment "DNS (allowlist)"
+    tcp dport 53 accept comment "DNS (allowlist)"
+    icmp type echo-request accept
+$app_rule
+    counter drop
+  }
+
+  # Traffic routed between LAN clients and the internet.
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    iifname "$LAN_IF" jump lan_out
+    oifname "$LAN_IF" ct state established,related accept
+    oifname "$LAN_IF" counter drop
+  }
+
+  chain lan_out {
+    ct state established,related accept
+    oifname != "$WAN_IF" counter drop
+$static_rules    limit rate 10/minute log prefix "lan-gw-drop: " level info
+    counter drop
+  }
+}
+
+table ip $NFT_NAT_TABLE {
+  chain prerouting {
+    type nat hook prerouting priority dstnat;
+$redirect_rule
+  }
+  chain postrouting {
+    type nat hook postrouting priority srcnat;
+    oifname "$WAN_IF" ip saddr $LAN_NET masquerade
+  }
+}
+EOF
+}
+
+render_dnsmasq() {
+  local d u
+  cat <<EOF
+# Generated by $NAME from $CONFIG_FILE — do not edit; edit config.env and run: sudo $NAME reload
+#
+# Serves DHCP + DNS on $LAN_IF only. Only the domains below resolve;
+# every other name gets REFUSED. Each answer's IPs are added to the
+# nftables set inet $NFT_TABLE $NFT_DNS_SET, which the firewall allows.
+
+interface=$LAN_IF
+except-interface=lo
+listen-address=$LAN_ADDR
+bind-interfaces
+
+# No default upstream: names not listed below are refused.
+no-resolv
+no-hosts
+domain-needed
+bogus-priv
+filter-AAAA
+cache-size=1000
+
+# DHCP for clients behind the access point
+dhcp-range=$DHCP_START,$DHCP_END,$LAN_MASK,$DHCP_LEASE
+dhcp-option=option:router,$LAN_ADDR
+dhcp-option=option:dns-server,$LAN_ADDR
+dhcp-authoritative
+
+# Tells Firefox to turn off its built-in DNS-over-HTTPS
+address=/use-application-dns.net/
+EOF
+  if [[ ${LOG_DNS_QUERIES:-no} == yes ]]; then echo "log-queries"; fi
+
+  if [[ -n ${LOCAL_APP_NAME:-} ]]; then
+    echo
+    echo "# Local application on this laptop"
+    echo "address=/$LOCAL_APP_NAME/$LAN_ADDR"
+  fi
+
+  echo
+  echo "# Allowed domains (subdomains included)"
+  for d in "${DOMAINS[@]}"; do
+    for u in "${UPSTREAMS[@]}"; do echo "server=/$d/$u"; done
+  done
+  echo
+  echo "# Add every resolved IPv4 of the allowed domains to the firewall set"
+  local list=""; for d in "${DOMAINS[@]}"; do list+="/$d"; done
+  echo "nftset=$list/4#inet#$NFT_TABLE#$NFT_DNS_SET"
+}
+
+render_all() {
+  local out="$1"
+  mkdir -p "$out"
+  render_nft     > "$out/rules.nft"
+  render_dnsmasq > "$out/dnsmasq.conf"
+  cat > "$out/env" <<EOF
+WAN_IF=$WAN_IF
+LAN_IF=$LAN_IF
+LAN_ADDR=$LAN_ADDR
+LAN_PREFIX=$LAN_PREFIX
+EOF
+}
+
+# -------------------------------------------------------------- runtime ----
+
+# Called by the systemd unit at boot and by reload.
+cmd_apply() {
+  need_root
+  # shellcheck source=/dev/null
+  source "$ETC_DIR/env"
+  ip link set dev "$LAN_IF" up
+  ip -4 addr flush dev "$LAN_IF"
+  ip addr add "$LAN_ADDR/$LAN_PREFIX" dev "$LAN_IF"
+  sysctl -q -w net.ipv4.ip_forward=1
+  nft delete table inet "$NFT_TABLE"     2>/dev/null || true
+  nft delete table ip   "$NFT_NAT_TABLE" 2>/dev/null || true
+  nft -f "$ETC_DIR/rules.nft"
+}
+
+cmd_down() {
+  need_root
+  nft delete table inet "$NFT_TABLE"     2>/dev/null || true
+  nft delete table ip   "$NFT_NAT_TABLE" 2>/dev/null || true
+  if [[ -f $ETC_DIR/env ]]; then
+    # shellcheck source=/dev/null
+    source "$ETC_DIR/env"
+    ip addr del "$LAN_ADDR/$LAN_PREFIX" dev "$LAN_IF" 2>/dev/null || true
+  fi
+}
+
+pkg_install() {
+  if command -v apt-get >/dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+  elif command -v dnf >/dev/null; then
+    dnf install -y "$@"
+  else
+    die "install these packages manually: $*"
+  fi
+}
+
+check_dnsmasq() {
+  local ver
+  ver="$(dnsmasq --version | head -1 | awk '{print $3}')"
+  if ! printf '%s\n%s\n' "2.87" "$ver" | sort -V -C; then
+    die "dnsmasq $ver is too old; 2.87+ is needed for nftset (Ubuntu 24.04 / Debian 12 / Fedora 37+ have it)"
+  fi
+  if dnsmasq --version | grep -q 'no-nftset'; then
+    die "this dnsmasq build has no nftset support"
+  fi
+}
+
+preflight_firewalls() {
+  if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    die "ufw is active and would block forwarding. Run 'sudo ufw disable' (or set DEFAULT_FORWARD_POLICY=\"ACCEPT\" in /etc/default/ufw) and try again"
+  fi
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    die "firewalld is active and would block forwarding. Run 'sudo systemctl disable --now firewalld' and try again"
+  fi
+  if command -v docker >/dev/null && systemctl is-active --quiet docker 2>/dev/null; then
+    warn "Docker is running; it sets the iptables FORWARD policy to DROP, which can block LAN clients."
+    warn "If clients get no internet, run: sudo iptables -I DOCKER-USER -i $LAN_IF -o $WAN_IF -j ACCEPT; sudo iptables -I DOCKER-USER -i $WAN_IF -o $LAN_IF -j ACCEPT"
+  fi
+}
+
+cmd_install() {
+  need_root
+  load_config "$SCRIPT_DIR/config.env"
+  detect_interfaces
+  validate_config
+  check_subnet_overlap
+  preflight_firewalls
+  info "Wi-Fi (internet): $WAN_IF    LAN (access point): $LAN_IF    LAN: $LAN_NET via $LAN_ADDR"
+
+  command -v nft >/dev/null || { info "Installing nftables"; pkg_install nftables; }
+
+  info "Writing $ETC_DIR"
+  mkdir -p "$ETC_DIR"
+  install -m 0644 "$SCRIPT_DIR/config.env" "$ETC_DIR/config.env"
+  # Record the detected interfaces so later reloads stay on the same ones.
+  sed -i -e "s|^WAN_IF=.*|WAN_IF=\"$WAN_IF\"|" -e "s|^LAN_IF=.*|LAN_IF=\"$LAN_IF\"|" "$ETC_DIR/config.env"
+  CONFIG_FILE="$ETC_DIR/config.env"
+  render_all "$ETC_DIR"
+  nft -c -f "$ETC_DIR/rules.nft" || die "generated firewall rules failed validation"
+  install -m 0755 "$SCRIPT_DIR/$NAME" "$BIN_PATH"
+
+  # Remember whether dnsmasq was already enabled, so uninstall can restore it.
+  if [[ ! -f $ETC_DIR/state ]]; then
+    if systemctl is-enabled --quiet dnsmasq 2>/dev/null; then echo "dnsmasq_was_enabled=yes"; else echo "dnsmasq_was_enabled=no"; fi > "$ETC_DIR/state"
+  fi
+
+  if command -v nmcli >/dev/null; then
+    info "Telling NetworkManager to leave $LAN_IF alone"
+    mkdir -p "$(dirname "$NM_CONF")"
+    printf '[keyfile]\nunmanaged-devices=interface-name:%s\n' "$LAN_IF" > "$NM_CONF"
+    nmcli device set "$LAN_IF" managed no 2>/dev/null || true
+  fi
+
+  echo "net.ipv4.ip_forward = 1" > "$SYSCTL_CONF"
+
+  cat > "$UNIT_PATH" <<EOF
+[Unit]
+Description=LAN gateway: LAN address, NAT and allowlist firewall
+Wants=network-pre.target
+After=network-pre.target
+Before=dnsmasq.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$BIN_PATH apply
+ExecStop=$BIN_PATH down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  info "Applying firewall and LAN address"
+  systemctl daemon-reload
+  systemctl enable --now "$NAME.service"
+  systemctl restart "$NAME.service"
+
+  # dnsmasq config goes in before the package is installed, so its
+  # first automatic start already uses our settings.
+  mkdir -p /etc/dnsmasq.d
+  install -m 0644 "$ETC_DIR/dnsmasq.conf" "$DNSMASQ_CONF"
+  if ! systemctl cat dnsmasq.service >/dev/null 2>&1; then
+    info "Installing dnsmasq"
+    pkg_install dnsmasq
+  fi
+  check_dnsmasq
+  dnsmasq --test -C "$DNSMASQ_CONF" >/dev/null 2>&1 || dnsmasq --test -C "$DNSMASQ_CONF"
+  systemctl enable dnsmasq >/dev/null 2>&1
+  systemctl restart dnsmasq
+
+  if [[ -n ${LOCAL_APP_REPO:-} ]]; then
+    install_app
+  fi
+
+  local url="http://${LOCAL_APP_NAME:-$LAN_ADDR}"
+  info "Done."
+  echo
+  echo "Next:"
+  echo "  1. Put the access point in Access Point / Bridge mode with its DHCP off,"
+  echo "     and plug the laptop into one of its LAN ports."
+  if [[ -z ${LOCAL_APP_REPO:-} ]]; then
+    echo "  2. Start your app listening on 0.0.0.0 or $LAN_ADDR (not 127.0.0.1) on port ${APP_PORTS[*]:-?}."
+  else
+    echo "  2. The app is running as a service (sudo $NAME app status)."
+  fi
+  echo "  3. Connect a phone to the access point and open $url"
+  echo "     (audience page: $url/audience), and https://idlistack.com"
+  echo "  4. Check with: sudo $NAME status"
+}
+
+# ------------------------------------------------------------ local app ----
+
+install_app() {
+  local user="${SUDO_USER:-}"
+  [[ -n $user && $user != root ]] || die "run the installer with sudo from your normal user account, so the app runs as that user"
+  local home; home="$(getent passwd "$user" | cut -d: -f6)"
+  local dir="${LOCAL_APP_DIR:-$home/$(basename "${LOCAL_APP_REPO%.git}")}"
+
+  command -v git >/dev/null || { info "Installing git"; pkg_install git; }
+  command -v python3 >/dev/null || { info "Installing python3"; pkg_install python3; }
+
+  if [[ -d $dir/.git ]]; then
+    local origin; origin="$(sudo -u "$user" git -C "$dir" remote get-url origin 2>/dev/null || true)"
+    [[ ${origin%.git} == "${LOCAL_APP_REPO%.git}" ]] || die "$dir already exists but is a different repository ($origin)"
+    info "Using existing app checkout in $dir"
+    if [[ -n ${LOCAL_APP_BRANCH:-} ]]; then
+      local cur; cur="$(sudo -u "$user" git -C "$dir" rev-parse --abbrev-ref HEAD)"
+      [[ $cur == "$LOCAL_APP_BRANCH" ]] || warn "$dir is on branch '$cur', not '$LOCAL_APP_BRANCH'. Leaving it as it is."
+    fi
+  elif [[ -e $dir ]]; then
+    die "$dir exists and is not a git checkout; set LOCAL_APP_DIR in config.env"
+  else
+    info "Cloning ${LOCAL_APP_REPO} (${LOCAL_APP_BRANCH:-default branch}) into $dir"
+    sudo -u "$user" git clone ${LOCAL_APP_BRANCH:+-b "$LOCAL_APP_BRANCH"} "$LOCAL_APP_REPO" "$dir"
+  fi
+
+  printf 'APP_USER=%q\nAPP_DIR=%q\n' "$user" "$dir" > "$ETC_DIR/app.env"
+
+  cat > "$APP_UNIT_PATH" <<EOF
+[Unit]
+Description=Local app served to the LAN by $NAME ($LOCAL_APP_REPO)
+After=$NAME.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=$user
+WorkingDirectory=$dir
+ExecStart=/usr/bin/env $LOCAL_APP_COMMAND
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$APP_UNIT" >/dev/null 2>&1
+  systemctl restart "$APP_UNIT"
+
+  # Wait for the app to answer on its first port.
+  local p="${APP_PORTS[0]:-}" _
+  if [[ -n $p ]]; then
+    for _ in $(seq 1 60); do
+      (exec 3<>"/dev/tcp/$LAN_ADDR/$p") 2>/dev/null && { info "App is up on http://$LAN_ADDR:$p/"; return 0; }
+      systemctl is-active --quiet "$APP_UNIT" || break
+      sleep 1
+    done
+    warn "the app did not answer on port $p yet; see: sudo $NAME app logs"
+  fi
+}
+
+cmd_app() {
+  need_root
+  [[ -f $APP_UNIT_PATH ]] || die "no app service installed (LOCAL_APP_REPO is blank in config.env)"
+  # shellcheck source=/dev/null
+  source "$ETC_DIR/app.env"
+  case "${1:-status}" in
+    status)  systemctl --no-pager status "$APP_UNIT" ;;
+    start|stop|restart) systemctl "$1" "$APP_UNIT" ;;
+    logs)    journalctl -u "$APP_UNIT" -f ;;
+    update)
+      info "Pulling latest code in $APP_DIR"
+      sudo -u "$APP_USER" git -C "$APP_DIR" pull --ff-only
+      systemctl restart "$APP_UNIT"
+      info "Updated and restarted. Note: restarting resets the live room." ;;
+    *) die "usage: $NAME app status|start|stop|restart|update|logs" ;;
+  esac
+}
+
+cmd_reload() {
+  need_root
+  [[ -f $ETC_DIR/config.env ]] || die "not installed; run: sudo ./$NAME install"
+  load_config "$ETC_DIR/config.env"
+  detect_interfaces
+  validate_config
+  local tmp; tmp="$(mktemp -d)"
+  render_all "$tmp"
+  nft -c -f "$tmp/rules.nft" || { rm -rf "$tmp"; die "new firewall rules failed validation; nothing changed"; }
+  dnsmasq --test -C "$tmp/dnsmasq.conf" >/dev/null 2>&1 || { dnsmasq --test -C "$tmp/dnsmasq.conf"; rm -rf "$tmp"; die "new dnsmasq config invalid; nothing changed"; }
+  install -m 0644 "$tmp/rules.nft" "$tmp/dnsmasq.conf" "$tmp/env" "$ETC_DIR/"
+  rm -rf "$tmp"
+  install -m 0644 "$ETC_DIR/dnsmasq.conf" "$DNSMASQ_CONF"
+  cmd_apply
+  # Restart dnsmasq so its cache is empty and the set refills from fresh lookups.
+  systemctl restart dnsmasq
+  info "Reloaded."
+}
+
+cmd_status() {
+  need_root
+  load_config "$ETC_DIR/config.env"
+  # shellcheck source=/dev/null
+  source "$ETC_DIR/env"
+  echo "Wi-Fi (internet): $WAN_IF    LAN: $LAN_IF ($LAN_ADDR/$LAN_PREFIX)"
+  echo "Service: $(systemctl is-active "$NAME" 2>/dev/null)   dnsmasq: $(systemctl is-active dnsmasq 2>/dev/null)   forwarding: $(sysctl -n net.ipv4.ip_forward)"
+  ip -br link show dev "$LAN_IF"
+  echo
+  echo "--- DHCP clients ---"
+  local leases
+  for leases in /var/lib/misc/dnsmasq.leases /var/lib/dnsmasq/dnsmasq.leases; do
+    [[ -f $leases ]] && { awk '{printf "  %-16s %-18s %s\n", $3, $2, $4}' "$leases"; break; }
+  done
+  echo
+  echo "--- IPs currently allowed via DNS ---"
+  nft list set inet "$NFT_TABLE" "$NFT_DNS_SET" 2>/dev/null | sed -n '/elements/,/}/p' || echo "  (none yet)"
+  echo
+  echo "--- Dropped packets ---"
+  nft list chain inet "$NFT_TABLE" lan_out 2>/dev/null | grep -E 'counter.*drop' | sed 's/^\s*/  /'
+  echo
+  echo "--- Local app ---"
+  local p
+  for p in ${LOCAL_APP_PORTS:-}; do
+    if ss -Hltn "sport = :$p" | awk '{print $4}' | grep -qE '^(0\.0\.0\.0|\*|\[::\]|'"${LAN_ADDR//./\\.}"'):'; then
+      echo "  port $p: listening and reachable from the LAN"
+    elif ss -Hltn "sport = :$p" | grep -q .; then
+      echo "  port $p: listening on localhost only. Bind the app to 0.0.0.0 or $LAN_ADDR"
+    else
+      echo "  port $p: nothing is listening"
+    fi
+  done
+  echo
+  echo "--- Recently refused DNS names (add any your sites need to ALLOWED_DOMAINS) ---"
+  journalctl -u dnsmasq --since "-30 min" --no-pager -o cat 2>/dev/null \
+    | awk '/query\[A\]/ {q=$2} /config .* is REFUSED|REFUSED/ {print "  " q}' | sort | uniq -c | sort -rn | head -15 || true
+  echo
+  echo "--- Recent firewall drops ---"
+  journalctl -k --since "-30 min" --no-pager -o cat 2>/dev/null | grep 'lan-gw-drop' | tail -5 | sed 's/^/  /' || true
+}
+
+cmd_check() {
+  need_root
+  local name="${1:?usage: $NAME check DOMAIN}"
+  # shellcheck source=/dev/null
+  source "$ETC_DIR/env"
+  local ips
+  if command -v dig >/dev/null; then
+    ips="$(dig +short +time=2 +tries=1 A "$name" @"$LAN_ADDR" | grep -E '^[0-9.]+$' || true)"
+  else
+    ips="$(nslookup -timeout=2 "$name" "$LAN_ADDR" 2>/dev/null | awk '/^Address: /{print $2}' | grep -E '^[0-9.]+$' || true)"
+  fi
+  if [[ -z $ips ]]; then
+    echo "$name: BLOCKED (DNS refused)"
+    return 1
+  fi
+  local ip ok=1
+  for ip in $ips; do
+    if nft get element inet "$NFT_TABLE" "$NFT_DNS_SET" "{ $ip }" >/dev/null 2>&1 \
+       || nft get element inet "$NFT_TABLE" allowed_static4 "{ $ip }" >/dev/null 2>&1; then
+      echo "$name -> $ip: allowed"
+    else
+      echo "$name -> $ip: resolves but IP is NOT in the firewall set"; ok=0
+    fi
+  done
+  (( ok ))
+}
+
+cmd_uninstall() {
+  need_root
+  info "Removing $NAME"
+  systemctl disable --now "$APP_UNIT" 2>/dev/null || true
+  systemctl disable --now "$NAME.service" 2>/dev/null || true
+  cmd_down
+  rm -f "$APP_UNIT_PATH" "$UNIT_PATH" "$DNSMASQ_CONF" "$SYSCTL_CONF"
+  if [[ -f $NM_CONF ]]; then
+    local lan; lan="$(sed -n 's/^unmanaged-devices=interface-name://p' "$NM_CONF")"
+    rm -f "$NM_CONF"
+    nmcli general reload conf 2>/dev/null || true
+    [[ -n $lan ]] && nmcli device set "$lan" managed yes 2>/dev/null || true
+  fi
+  if grep -q 'dnsmasq_was_enabled=no' "$ETC_DIR/state" 2>/dev/null; then
+    systemctl disable --now dnsmasq 2>/dev/null || true
+  else
+    systemctl restart dnsmasq 2>/dev/null || true
+  fi
+  systemctl daemon-reload
+  sysctl -q -w net.ipv4.ip_forward=0 || true
+  rm -rf "$ETC_DIR" "$BIN_PATH"
+  info "Done. Normal networking restored. (The app's code folder was left in place.)"
+}
+
+cmd_render() {
+  local out="${1:?usage: $NAME render DIR}"
+  load_config "${2:-}"
+  # Rendering for review works without real interfaces.
+  WAN_IF="${WAN_IF:-wlan0}"; LAN_IF="${LAN_IF:-eth0}"
+  validate_config
+  render_all "$out"
+  echo "Wrote $out/rules.nft, $out/dnsmasq.conf (WAN_IF=$WAN_IF LAN_IF=$LAN_IF)"
+}
+
+case "${1:-}" in
+  install)   cmd_install ;;
+  reload)    cmd_reload ;;
+  apply)     cmd_apply ;;
+  down)      cmd_down ;;
+  status)    cmd_status ;;
+  check)     shift; cmd_check "$@" ;;
+  app)       shift; cmd_app "$@" ;;
+  uninstall) cmd_uninstall ;;
+  render)    shift; cmd_render "$@" ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
