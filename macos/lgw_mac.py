@@ -334,6 +334,8 @@ def render_pf(cfg):
             for table in (DNS_TABLE, STATIC_TABLE):
                 lines.append("pass in quick on $lan_if inet proto %s from $lan_net to <%s> port %s"
                              % (proto, table, lst(plist)))
+    # https://app.lan: refuse at once (TCP reset) so browsers fall back to http instead of waiting
+    lines.append("block return in quick on $lan_if inet proto tcp from $lan_net to $lan_addr port 443")
     lines += ["block drop in quick on $lan_if all", ""]
     return "\n".join(lines)
 

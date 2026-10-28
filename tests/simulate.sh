@@ -49,6 +49,7 @@ t "client: blocked site by raw IP"          no   $C curl -sf -m3 http://10.99.0.
 t "client: bypass DNS via outside server"   no   $C dig +short +time=2 +tries=1 blocked.example @10.99.0.53
 t "client: local app via http://app.lan"    ok   sh -c "$C curl -sf -m3 --resolve app.lan:80:\$($C dig +short app.lan @192.168.50.1) http://app.lan/ | grep -q 'local app'"
 t "client: local app on :8688"              ok   $C curl -sf -m3 http://192.168.50.1:8688/
+t "client: https://app.lan refused at once"  ok   sh -c "$C curl -s -m 2 https://192.168.50.1/ ; [ \$? -eq 7 ]"
 t "client: laptop SSH port closed"          no   $C curl -s -m3 telnet://192.168.50.1:22
 t "laptop: own access to blocked site"      ok   ip netns exec laptop curl -sf -m3 http://10.99.0.60/
 t "laptop: own DNS to outside server"       ok   ip netns exec laptop dig +short +time=2 +tries=1 blocked.example @10.99.0.53

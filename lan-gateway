@@ -208,6 +208,7 @@ $static_set
     tcp dport 53 accept comment "DNS (allowlist)"
     icmp type echo-request accept
 $app_rule
+    tcp dport 443 reject with tcp reset comment "https://app.lan: refuse at once so browsers fall back to http"
     counter drop
   }
 
