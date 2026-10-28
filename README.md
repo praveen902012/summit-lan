@@ -1,5 +1,7 @@
 # summit-lan
 
+**Running the event? Start with the [runbook](RUNBOOK.md)**: setup, the Summit game, event-day checklist and troubleshooting.
+
 Laptop-as-gateway for the gamesworkshop Summit: share Wi-Fi internet to an access point, allow only a short list of sites, and serve the Summit app to the room. Scripts: `lan-gateway` (Linux) and `macos/lan-gateway-mac` (macOS).
 
 Turns a laptop (**Ubuntu/Linux** or **macOS**) into a filtered gateway for an access point:
