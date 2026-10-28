@@ -15,6 +15,15 @@ Internet ── Wi-Fi ── [ laptop: NAT + DHCP + DNS allowlist + firewall ] �
   - the **gamesworkshop Summit** app (`pixel` branch) running on the laptop, at `http://app.lan` (audience: `http://app.lan/audience`)
 - Everything else is blocked, including other DNS servers, DNS-over-HTTPS, and visiting sites by raw IP.
 
+## Capacity (200 devices)
+
+- **Addresses:** the LAN is `192.168.50.0/23`, which gives 497 DHCP addresses with 2-hour leases. That leaves room for phones that reconnect with a new random MAC address.
+- **Access points are the real limit.** One consumer router in AP mode handles about 30–60 active phones. For 200, use **4 access points** (about 50 each), or 2–3 business-grade ones:
+  - Connect them all to a **switch**, and the switch to the laptop's Ethernet.
+  - Put every AP in **Access Point / Bridge mode** with **DHCP off**, the **same SSID and password**, and **different channels** (5 GHz: 36, 52, 100, 149; 2.4 GHz: 1, 6, 11).
+- **The laptop is fine.** The firewall, DNS allowlist and Summit app (one live connection per phone) easily handle 200 phones. Blocked traffic doesn't use firewall memory; only allowed connections do.
+- **Internet:** all phones share the laptop's Wi-Fi uplink, but only the allowed sites use it. Summit itself is local. Keep the laptop near its Wi-Fi router, on a channel different from the APs.
+
 ## How it works
 
 1. **dnsmasq** hands out addresses (DHCP) and answers DNS only for allowed domains. Every other name gets `REFUSED`.

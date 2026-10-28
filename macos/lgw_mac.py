@@ -230,6 +230,19 @@ def service_for_device(dev):
     return None
 
 
+def is_real_ethernet(port, dev):
+    """Exclude Wi-Fi, Bluetooth, iPhone USB, the Thunderbolt Bridge ports ("Thunderbolt 1"),
+    and the "Ethernet Adapter (enN)" placeholders macOS creates on Apple-silicon Macs."""
+    p = port.lower()
+    if not dev.startswith("en"):
+        return False
+    if any(s in p for s in ("wi-fi", "bluetooth", "thunderbolt bridge", "iphone", "ipad")):
+        return False
+    if re.match(r"^thunderbolt \d+$", p) or re.match(r"^ethernet adapter \(en\d+\)$", p):
+        return False
+    return True
+
+
 def detect_interfaces(cfg):
     hw = hardware_ports()
     if not cfg.wan_if:
@@ -241,17 +254,24 @@ def detect_interfaces(cfg):
         if not any(d == cfg.wan_if and "wi-fi" in p.lower() for p, d in hw):
             warn("%s (default route) is not Wi-Fi; set WAN_IF if that is wrong" % cfg.wan_if)
     if not cfg.lan_if:
-        skip = ("wi-fi", "bluetooth", "thunderbolt bridge", "iphone", "ipad")
-        cands = [d for p, d in hw
-                 if d != cfg.wan_if and d.startswith("en") and not any(s in p.lower() for s in skip)]
-        active = [d for d in cands if "status: active" in run(["ifconfig", d], check=False)]
-        pick = active if len(active) == 1 else cands
-        if len(pick) != 1:
-            names = ", ".join("%s (%s)" % (d, p) for p, d in hw if d in cands) or "none"
-            raise Fail("could not pick the Ethernet port automatically. Candidates: %s.\n"
-                       "Plug in the cable to the access point, or set LAN_IF in config.env "
-                       "(see: networksetup -listallhardwareports)" % names)
-        cfg.lan_if = pick[0]
+        cands = [(p, d) for p, d in hw if d != cfg.wan_if and is_real_ethernet(p, d)]
+        active = [(p, d) for p, d in cands if "status: active" in run(["ifconfig", d], check=False)]
+        if len(active) == 1:
+            pick = active
+        elif len(cands) == 1:
+            pick = cands
+        else:
+            pick = []
+        if not pick:
+            if not cands:
+                raise Fail("no Ethernet adapter found. Plug your USB-C/Thunderbolt Ethernet adapter into the Mac\n"
+                           "(it shows up as e.g. 'USB 10/100/1000 LAN' in: networksetup -listallhardwareports),\n"
+                           "connect its cable to a LAN port on the access point, and run this again.")
+            names = ", ".join("%s (%s%s)" % (d, p, ", cable connected" if (p, d) in active else "")
+                              for p, d in cands)
+            raise Fail("more than one Ethernet adapter: %s.\n"
+                       "Connect only the one going to the access point, or set LAN_IF in config.env" % names)
+        cfg.lan_if = pick[0][1]
     devs = [d for _, d in hw]
     for dev in (cfg.wan_if, cfg.lan_if):
         if dev not in devs:
