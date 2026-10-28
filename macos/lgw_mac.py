@@ -770,12 +770,63 @@ def cmd_daemon(args):
 # ------------------------------------------------------------ launchd ----
 
 def launchd_load(plist_path, label):
+    """(Re)load a launch daemon; returns launchctl's error text, or "" on success."""
+    run(["launchctl", "enable", "system/" + label], check=False)
     run(["launchctl", "bootout", "system/" + label], check=False)
     time.sleep(0.5)
-    out = run(["launchctl", "bootstrap", "system", plist_path], check=False)
+    out = run(["launchctl", "bootstrap", "system", plist_path], check=False).strip()
     if "error" in out.lower() or "failed" in out.lower():
-        run(["launchctl", "load", "-w", plist_path], check=False)
-    run(["launchctl", "enable", "system/" + label], check=False)
+        out2 = run(["launchctl", "load", "-w", plist_path], check=False).strip()
+        if launchd_running(label) == "not loaded":
+            return (out + "\n" + out2).strip()
+    return ""
+
+
+def app_log_path(st):
+    return os.path.join(pwd.getpwnam(st["app_user"]).pw_dir, "Library/Logs/lan-gateway-app.log")
+
+
+def app_port():
+    try:
+        cfg = Config(CONFIG)
+        return (str(cfg.lan_addr), cfg.app_ports[0]) if cfg.app_ports else (None, None)
+    except Fail:
+        return (None, None)
+
+
+def app_answering(timeout=60):
+    host, port = app_port()
+    if not port:
+        return True
+    end = time.time() + timeout
+    while True:
+        for h in (host, "127.0.0.1"):
+            try:
+                socket.create_connection((h, port), timeout=1).close()
+                return True
+            except OSError:
+                pass
+        if time.time() > end or launchd_running(APP_LABEL) == "not loaded":
+            return False
+        time.sleep(1)
+
+
+def app_start(st):
+    """Load and start the app service; returns (ok, message)."""
+    err = launchd_load(APP_PLIST, APP_LABEL)
+    if err:
+        return False, "launchd could not load the app service:\n  %s" % err.replace("\n", "\n  ")
+    if app_answering():
+        host, port = app_port()
+        return True, "Summit is running: http://localhost:%s/ on this Mac, http://app.lan/audience on phones" % port
+    tail = ""
+    try:
+        with open(app_log_path(st), errors="replace") as f:
+            tail = "".join(f.readlines()[-15:])
+    except OSError:
+        pass
+    return False, ("the app service started but Summit isn't answering yet. Last lines of its log:\n%s"
+                   % (tail or "  (log is empty)"))
 
 
 def launchd_running(label):
@@ -1105,23 +1156,44 @@ def cmd_app(args):
         raise Fail("no app service installed (LOCAL_APP_REPO is blank in config.env)")
     st = load_state()
     sub = args[0] if args else "status"
-    log = os.path.join(pwd.getpwnam(st["app_user"]).pw_dir, "Library/Logs/lan-gateway-app.log")
+    log = app_log_path(st)
+    state = launchd_running(APP_LABEL)
     if sub == "status":
-        print("app service: %s" % launchd_running(APP_LABEL))
-        print(run(["launchctl", "print", "system/" + APP_LABEL], check=False)[:1500])
+        host, port = app_port()
+        if state == "not loaded":
+            print("Summit app: STOPPED (the service isn't loaded, e.g. after 'app stop').")
+            print("Start it with:  sudo lan-gateway-mac app start")
+            return 1
+        up = app_answering(timeout=0)
+        out = run(["launchctl", "print", "system/" + APP_LABEL], check=False)
+        pid = re.search(r"\bpid = (\d+)", out)
+        print("Summit app: %s%s" % ("RUNNING" if up else "starting / not answering (%s)" % state,
+                                     ", pid %s" % pid.group(1) if pid else ""))
+        print("  code:   %s" % st.get("app_dir", "?"))
+        print("  open:   http://localhost:%s/ on this Mac, http://app.lan/audience on phones" % port)
+        print("  log:    %s" % log)
+        return 0 if up else 1
     elif sub == "start":
-        launchd_load(APP_PLIST, APP_LABEL)
+        ok, msg = app_start(st)
+        if not ok:
+            raise Fail(msg)
+        info(msg)
     elif sub == "stop":
         run(["launchctl", "bootout", "system/" + APP_LABEL], check=False)
         info("Stopped. It starts again at boot, or with: sudo lan-gateway-mac app start")
-    elif sub == "restart":
-        run(["launchctl", "kickstart", "-k", "system/" + APP_LABEL], check=False)
-        info("Restarted. Note: restarting resets the live room.")
-    elif sub == "update":
-        info("Pulling latest code in %s" % st["app_dir"])
-        print(as_user(st["app_user"], [find_git(), "-C", st["app_dir"], "pull", "--ff-only"]))
-        run(["launchctl", "kickstart", "-k", "system/" + APP_LABEL], check=False)
-        info("Updated and restarted. Note: restarting resets the live room.")
+    elif sub in ("restart", "update"):
+        if sub == "update":
+            info("Pulling latest code in %s" % st["app_dir"])
+            print(as_user(st["app_user"], [find_git(), "-C", st["app_dir"], "pull", "--ff-only"]))
+        if state == "not loaded":
+            ok, msg = app_start(st)
+        else:
+            run(["launchctl", "kickstart", "-k", "system/" + APP_LABEL], check=False)
+            ok = app_answering()
+            msg = "Restarted. The live room starts over." if ok else "restarted, but Summit isn't answering; see: sudo lan-gateway-mac app logs"
+        if not ok:
+            raise Fail(msg)
+        info(msg)
     elif sub == "logs":
         os.execvp("tail", ["tail", "-n", "50", "-f", log])
     else:

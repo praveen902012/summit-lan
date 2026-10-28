@@ -555,12 +555,16 @@ def scan(url):
 def app_action(action):
     if sys.platform != "darwin" or not os.path.exists(m.APP_PLIST):
         raise m.Fail("the Summit app service is not installed")
-    if action == "restart":
+    if action in ("restart", "start") and m.launchd_running(m.APP_LABEL) == "not loaded":
+        err = m.launchd_load(m.APP_PLIST, m.APP_LABEL)
+        if err:
+            raise m.Fail("launchd could not load the app service: " + err)
+    elif action == "restart":
         m.run(["launchctl", "kickstart", "-k", "system/" + m.APP_LABEL], check=False)
     elif action == "stop":
         m.run(["launchctl", "bootout", "system/" + m.APP_LABEL], check=False)
     elif action == "start":
-        m.launchd_load(m.APP_PLIST, m.APP_LABEL)
+        pass
     else:
         raise m.Fail("unknown action")
     return {"ok": True}
