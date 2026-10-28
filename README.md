@@ -161,6 +161,24 @@ Mac notes:
 - If the macOS application firewall is on, the installer allows the Python it uses, so phones can reach DNS and the app.
 - When the Mac sleeps, the access point loses internet and the app. Keep it plugged in and stop it sleeping (e.g. `caffeinate -s` in a Terminal) during sessions.
 
+## Phones on mobile data
+
+Phones test each Wi-Fi network as soon as they join it. If the test fails, they keep using **mobile data** for everything, so `app.lan` and the allowed sites seem broken until data is turned off. To make phones trust this Wi-Fi and use it first, the allowlist includes the test addresses:
+
+- **Android:**
+  - `connectivitycheck.gstatic.com` (the HTTP test)
+  - `www.google.com` (the HTTPS test, required since Android 10; otherwise Android shows "limited connectivity")
+  - fallbacks: `play.googleapis.com`, `clients3.google.com`, `www.gstatic.com`
+- **Phone makers:** Xiaomi `connect.rom.miui.com`, Huawei `connectivitycheck.platform.hicloud.com`, Vivo `wifi.vivo.com.cn`
+- **Apple:** `captive.apple.com`
+- **Windows:** `www.msftconnecttest.com`, `www.msftncsi.com`, `dns.msftncsi.com`, `edge.microsoft.com` (Windows 11)
+
+Allowing `www.google.com` means Google Search works on the Wi-Fi. Other Google services (Gmail, YouTube, Maps, `google.com` itself) stay blocked.
+
+iPhones with **iCloud Private Relay** turned on are told it isn't available on this network, using the signal Apple documents (a "no such name" answer for `mask.icloud.com` and `mask-h2.icloud.com`). They show a short notice, and then use the Wi-Fi normally.
+
+A phone that joined before these addresses were allowed may have remembered "no internet". Have people forget the network and join again, or turn Wi-Fi off and on.
+
 ## Notes and limits (Linux)
 
 - IPv6 is not routed to the LAN, so devices use IPv4 only. dnsmasq filters AAAA records so they don't wait on IPv6.
